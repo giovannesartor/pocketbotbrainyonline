@@ -1,0 +1,29 @@
+# Ambiente virtual
+.venv/
+venv/
+env/
+
+# Credenciais e dados sensíveis — NUNCA subir para o repositório
+pocket_brainy/data/config.json
+pocket_brainy/data/session.json
+pocket_brainy/data/history.json
+pocket_brainy/data/ranking.json
+pocket_brainy/data/strategies.json
+pocket_brainy/data/logs/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Playwright
+playwright/.auth/
