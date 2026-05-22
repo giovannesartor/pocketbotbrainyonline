@@ -102,7 +102,7 @@ class SupportResistanceStrategy(BaseStrategy):
             weight=self.weight_for(timeframe),
             confluence=flags,
             notes=(
-                f"{'Suporte' if direction == 'CALL' else 'Resist\u00eancia'}={level:.5f} "
+                f"{'Suporte' if direction == 'CALL' else 'Resistência'}={level:.5f} "
                 f"RSI={rsi[-1]:.1f} Toques={touches} ADX={adx[-1]:.1f}"
             ),
         )

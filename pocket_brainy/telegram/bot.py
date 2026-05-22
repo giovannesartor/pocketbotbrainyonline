@@ -70,10 +70,45 @@ class TelegramInterface:
 
         await self.app.initialize()
         await self.app.start()
+        # 🔒 Claim do lock de polling: força esta instância a virar a "dona" do bot.
+        # Se houver outra instância rodando (local em paralelo, deploy antigo), ela
+        # vai começar a receber Conflict e o PTB dela vai parar sozinho.
+        await self._claim_polling_lock()
         await self.app.updater.start_polling(drop_pending_updates=True)
         self._running = True
         logger.info("Telegram bot em polling.")
         await self._greet()
+
+    async def _claim_polling_lock(self) -> None:
+        """Toma o lock de getUpdates de qualquer outra instância rodando.
+
+        Apaga webhook + descarta updates pendentes + faz alguns getUpdates com
+        timeout curto. Cada chamada bem-sucedida invalida o getUpdates pendente
+        de OUTRAS instâncias (Telegram só aceita um cliente por vez).
+        """
+        from telegram.error import Conflict as _Conflict
+        try:
+            await self.app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.warning(f"delete_webhook falhou (ok ignorar): {e}")
+
+        for attempt in range(1, 6):
+            try:
+                await self.app.bot.get_updates(timeout=1, offset=-1)
+                logger.info(f"✅ Polling lock adquirido (tentativa {attempt}).")
+                return
+            except _Conflict:
+                logger.warning(
+                    f"⏳ Outra instância segura o polling — tentando expulsar ({attempt}/5)..."
+                )
+                await asyncio.sleep(2 * attempt)
+            except Exception as e:
+                logger.warning(f"get_updates erro (tentativa {attempt}): {e}")
+                await asyncio.sleep(1)
+        logger.warning(
+            "⚠️ Não consegui tomar o lock — outra instância está muito agressiva. "
+            "Vou seguir mesmo assim; o PTB continua tentando em background."
+        )
 
     async def stop(self) -> None:
         if not self.app:
