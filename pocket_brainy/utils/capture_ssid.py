@@ -49,6 +49,9 @@ def _validate_auth_frame(payload: str) -> Optional[str]:
     except Exception:
         return None
 
+
+async def capture_ssid_async(
+    on_progress: Optional[Callable[[str], None]] = None,
     email: Optional[str] = None,
     password: Optional[str] = None,
     headless: Optional[bool] = None,
@@ -298,10 +301,5 @@ async def _try_auto_login(page, email: str, password: str, prefer_demo: bool, no
         await page.wait_for_url("**/cabinet/**", timeout=20_000)
         notify("✅ Login OK — agora aguardando o frame de auth do WebSocket.")
     except Exception:
-        notify("⚠️ Não houve redirect — possivelmente captcha/2FA bloqueou o login."): time.time(),
-    }
-    with open(SESSION_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-    return auth_frame
+        notify("⚠️ Não houve redirect — possivelmente captcha/2FA bloqueou o login.")
 
