@@ -530,6 +530,8 @@ class PocketBrainyBot:
         ssid = await capture_ssid_async(
             on_progress=_progress,
             prefer_demo=self.cfg_manager.config.po_demo,
+            email=self.cfg_manager.config.po_email,
+            password=self.cfg_manager.config.po_password,
         )
 
         if not ssid:

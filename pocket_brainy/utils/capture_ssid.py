@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
-SESSION_PATH = Path(__file__).parent.parent / "data" / "session.json"
+_DATA_DIR = Path(os.environ.get(
+    "POCKET_DATA_DIR",
+    str(Path(__file__).parent.parent / "data"),
+))
+SESSION_PATH = _DATA_DIR / "session.json"
 
 
 def _is_auth_frame(payload: str) -> bool:
@@ -44,11 +49,9 @@ def _validate_auth_frame(payload: str) -> Optional[str]:
     except Exception:
         return None
 
-
-async def capture_ssid_async(
-    on_progress: Optional[Callable[[str], None]] = None,
-    timeout_seconds: int = 180,
-    prefer_demo: bool = True,
+    email: Optional[str] = None,
+    password: Optional[str] = None,
+    headless: Optional[bool] = None,
 ) -> Optional[str]:
     """Abre o Chrome do sistema com perfil persistente e captura o frame de auth.
 
@@ -56,6 +59,9 @@ async def capture_ssid_async(
       • Primeira vez: abre /cabinet/, redireciona pro login, usuário loga, captura.
       • Próximas vezes: perfil persistente já tem cookies → vai direto pro cabinet,
         Pocket Option estabelece WebSocket sozinho, frame é capturado em segundos.
+
+    Em ambiente headless (Railway/Docker) usa `headless=True` automaticamente e,
+    se `email`+`password` forem fornecidos, tenta o login automático.
 
     Retorna o frame Socket.IO completo '42["auth",{...}]' pronto para uso.
     """
@@ -70,8 +76,12 @@ async def capture_ssid_async(
             except Exception:
                 pass
 
+    # Decide headless: parâmetro explícito > env var POCKET_HEADLESS > default False
+    if headless is None:
+        headless = os.environ.get("POCKET_HEADLESS", "").lower() in ("1", "true", "yes")
+
     # Perfil persistente: cookies sobrevivem entre execuções
-    profile_dir = Path(__file__).parent.parent / "data" / "chrome_profile"
+    profile_dir = _DATA_DIR / "chrome_profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
@@ -80,24 +90,28 @@ async def capture_ssid_async(
         # Tenta usar o Chrome instalado (channel="chrome"); se falhar, cai no Chromium
         ctx = None
         last_err = None
-        for channel_try in ("chrome", "chrome-beta", "msedge", None):
+        # Em headless, vai direto pro Chromium (channel=None) — canais "chrome"/"msedge"
+        # raramente existem em containers Linux e geram erro de canal não encontrado.
+        channels_to_try = (None,) if headless else ("chrome", "chrome-beta", "msedge", None)
+        for channel_try in channels_to_try:
             try:
                 ctx = await p.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
                     channel=channel_try,         # None = Chromium do Playwright
-                    headless=False,
+                    headless=headless,
                     viewport={"width": 1280, "height": 800},
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--disable-dev-shm-usage",
+                        "--no-sandbox",
                     ],
                 )
                 if channel_try:
                     _notify(f"✅ Usando navegador: {channel_try}")
                 else:
-                    _notify("✅ Usando Chromium (fallback — Chrome não encontrado)")
+                    _notify("✅ Usando Chromium (headless)" if headless else "✅ Usando Chromium")
                 break
             except Exception as e:
                 last_err = e
@@ -142,6 +156,13 @@ async def capture_ssid_async(
                 _notify(f"✅ Página aberta ({'DEMO' if prefer_demo else 'REAL'}). Se não estiver logado, faça login.")
             except Exception as e:
                 _notify(f"⚠️ Falha ao carregar página: {e}. Tentando mesmo assim.")
+
+            # Auto-login: se headless e tiver credenciais, preenche o form de login
+            if headless and email and password:
+                try:
+                    await _try_auto_login(page, email, password, prefer_demo, _notify)
+                except Exception as e:
+                    _notify(f"⚠️ Auto-login falhou: {e}")
 
             # Aguarda o frame de auth — filtra pelo isDemo desejado se possível
             target_demo = 1 if prefer_demo else 0
@@ -189,6 +210,95 @@ async def capture_ssid_async(
         "cookies": cookies,
         "_ts": time.time(),
         "_ts_cookies": time.time(),
+    }
+    with open(SESSION_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    return auth_frame
+
+
+async def _try_auto_login(page, email: str, password: str, prefer_demo: bool, notify) -> None:
+    """Detecta o form de login da Pocket Option e preenche email/senha automaticamente.
+
+    PocketOption redireciona pra /login/ quando não há sessão. O formulário usa
+    inputs `type="email"` e `type="password"` + botão `type="submit"`.
+    """
+    # Espera a página estabilizar (até 15s)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    except Exception:
+        pass
+
+    url = page.url or ""
+    if "login" not in url and "auth" not in url:
+        # já está logado (cookies persistentes) — nada a fazer
+        return
+
+    notify("🔐 Tela de login detectada — preenchendo credenciais...")
+
+    # Preenche email
+    email_sel = None
+    for sel in ('input[type="email"]', 'input[name="email"]', 'input[name="login"]'):
+        try:
+            await page.wait_for_selector(sel, timeout=8_000)
+            email_sel = sel
+            break
+        except Exception:
+            continue
+    if not email_sel:
+        notify("⚠️ Não encontrei campo de email — formulário mudou?")
+        return
+
+    await page.fill(email_sel, email)
+    await asyncio.sleep(0.3)
+
+    pwd_sel = None
+    for sel in ('input[type="password"]', 'input[name="password"]'):
+        try:
+            await page.wait_for_selector(sel, timeout=5_000)
+            pwd_sel = sel
+            break
+        except Exception:
+            continue
+    if not pwd_sel:
+        notify("⚠️ Não encontrei campo de senha — formulário mudou?")
+        return
+
+    await page.fill(pwd_sel, password)
+    await asyncio.sleep(0.3)
+
+    # Submit: tenta vários seletores comuns + Enter como fallback
+    submitted = False
+    for sel in (
+        'button[type="submit"]',
+        'form button:has-text("Sign in")',
+        'form button:has-text("Login")',
+        'form button:has-text("Entrar")',
+    ):
+        try:
+            await page.click(sel, timeout=3_000)
+            submitted = True
+            break
+        except Exception:
+            continue
+    if not submitted:
+        try:
+            await page.press(pwd_sel, "Enter")
+            submitted = True
+        except Exception:
+            pass
+
+    if not submitted:
+        notify("⚠️ Não consegui clicar no botão de login.")
+        return
+
+    notify("⏳ Enviado — aguardando redirect pro cabinet...")
+    # Aguarda navegação pro cabinet (até 20s)
+    try:
+        await page.wait_for_url("**/cabinet/**", timeout=20_000)
+        notify("✅ Login OK — agora aguardando o frame de auth do WebSocket.")
+    except Exception:
+        notify("⚠️ Não houve redirect — possivelmente captcha/2FA bloqueou o login."): time.time(),
     }
     with open(SESSION_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
