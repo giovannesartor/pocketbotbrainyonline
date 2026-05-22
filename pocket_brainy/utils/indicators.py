@@ -96,11 +96,12 @@ class Indicators:
             dn = l[i - 1] - l[i]
             pdm[i] = up if up > dn and up > 0 else 0
             ndm[i] = dn if dn > up and dn > 0 else 0
-        atr = Indicators.ema(tr, period)
-        pdi = 100 * Indicators.ema(pdm, period) / np.where(atr == 0, 1e-10, atr)
-        ndi = 100 * Indicators.ema(ndm, period) / np.where(atr == 0, 1e-10, atr)
+        # Wilder's smoothing (SMMA) — compatível com TradingView/MT4
+        atr = Indicators.smma(tr, period)
+        pdi = 100 * Indicators.smma(pdm, period) / np.where(atr == 0, 1e-10, atr)
+        ndi = 100 * Indicators.smma(ndm, period) / np.where(atr == 0, 1e-10, atr)
         dx = 100 * np.abs(pdi - ndi) / np.where((pdi + ndi) == 0, 1e-10, pdi + ndi)
-        return Indicators.ema(dx, period)
+        return Indicators.smma(dx, period)
 
     # ----------------- Volatilidade -----------------
     @staticmethod
@@ -159,6 +160,28 @@ class Indicators:
                     ep = l[i]
                     af = min(af + af_step, af_max)
         return sar
+
+    @staticmethod
+    def stochastic(
+        high: Sequence[float],
+        low: Sequence[float],
+        close: Sequence[float],
+        k_period: int = 14,
+        d_period: int = 3,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Estocástico clássico: retorna (%K, %D)."""
+        h = _to_array(high)
+        l = _to_array(low)
+        c = _to_array(close)
+        n = len(c)
+        k = np.full(n, np.nan)
+        for i in range(k_period - 1, n):
+            hh = h[i - k_period + 1 : i + 1].max()
+            ll = l[i - k_period + 1 : i + 1].min()
+            denom = hh - ll
+            k[i] = 100.0 * (c[i] - ll) / denom if denom > 1e-10 else 50.0
+        d = Indicators.sma(k, d_period)
+        return k, d
 
 
 @dataclass

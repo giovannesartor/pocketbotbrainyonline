@@ -46,8 +46,8 @@ class RiskManager:
         # streak de loss
         if self.state.current_loss_streak >= self.cfg.max_loss_streak:
             return RiskDecision(False, f"Streak de loss atingiu {self.state.current_loss_streak}.")
-        # delay entre operações
-        if self.state.last_trade_time is not None:
+        # delay entre operações — BYPASS em scalper (cooldown já é por ativo)
+        if self.state.last_trade_time is not None and not getattr(self.cfg, "scalper_mode", False):
             since = time.time() - self.state.last_trade_time
             if since < self.cfg.delay_between_trades:
                 remaining = self.cfg.delay_between_trades - since

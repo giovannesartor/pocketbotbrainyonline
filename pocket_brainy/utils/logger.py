@@ -1,8 +1,9 @@
-"""Sistema de logging centralizado (arquivo + console)."""
+"""Sistema de logging centralizado (arquivo + console) — timestamps em BRT."""
 from __future__ import annotations
 
 import logging
 import sys
+import time as _time_mod
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -11,6 +12,18 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _FMT = "%(asctime)s | %(levelname)-8s | %(name)-22s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+_BRT_OFFSET = -3 * 3600  # UTC-3
+
+
+class _BRTFormatter(logging.Formatter):
+    """Formatter que exibe timestamps em BRT (UTC-3)."""
+
+    def converter(self, timestamp):  # type: ignore[override]
+        return _time_mod.gmtime(timestamp + _BRT_OFFSET)
+
+    def formatTime(self, record, datefmt=None):
+        ct = self.converter(record.created)
+        return _time_mod.strftime(datefmt or _DATEFMT, ct)
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -20,7 +33,7 @@ def setup_logging(level: str = "INFO") -> None:
         return
 
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
-    formatter = logging.Formatter(_FMT, _DATEFMT)
+    formatter = _BRTFormatter(_FMT, _DATEFMT)
 
     # Console
     console = logging.StreamHandler(sys.stdout)

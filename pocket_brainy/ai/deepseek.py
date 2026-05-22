@@ -31,13 +31,18 @@ CACHE_TTL_SECONDS = 180      # 3 minutos — sinais mudam rápido, especialmente
 CACHE_MAX_SIZE = 256         # LRU simples
 
 
-def get_api_key() -> str:
-    """Retorna a chave da DeepSeek — obrigatoriamente via variável de ambiente."""
-    key = os.environ.get("DEEPSEEK_API_KEY") or DEEPSEEK_API_KEY
+def get_api_key(override: str = "") -> str:
+    """Retorna a chave da DeepSeek.
+    Prioridade: override (config.json) → variável DEEPSEEK_API_KEY → DEEPSEEK_API_KEY hardcode.
+    """
+    key = override or os.environ.get("DEEPSEEK_API_KEY") or DEEPSEEK_API_KEY
     if not key:
         raise RuntimeError(
-            "DEEPSEEK_API_KEY não definida. "
-            "Configure a variável de ambiente DEEPSEEK_API_KEY antes de iniciar o bot."
+            "DEEPSEEK_API_KEY não definida.\n"
+            "Opções:\n"
+            "  1. Adicione \"deepseek_api_key\": \"sua-chave\" em pocket_brainy/data/config.json\n"
+            "  2. Defina a variável de ambiente: export DEEPSEEK_API_KEY=sua-chave\n"
+            "  3. Desative a IA: \"ai_enabled\": false em config.json"
         )
     return key
 
@@ -55,15 +60,37 @@ class AIDecision:
 
 
 SYSTEM_PROMPT = (
-    "Você é um analista quantitativo especializado em opções binárias OTC. "
-    "Recebe um sinal com indicadores e histórico recente e decide se deve OPERAR ou IGNORAR. "
-    "Para OTC: RSI<30 (PUT) ou RSI>70 (CALL) com MACD confirmando são entradas de alta qualidade. "
-    "ADX alto (>40) indica tendência forte — em OTC isso é FAVORÁVEL se a direção coincidir com a tendência. "
-    "Score>9 com confiança>90% e payout>85% = sinal de alta qualidade, prefira OPERAR. "
-    "recent_results mostra os últimos resultados neste ativo — 1 LOSS pontual não invalida um sinal forte. "
-    "Só recomende IGNORAR se houver razão técnica clara (RSI neutro, MACD divergindo, volatilidade extrema). "
+    "Você é um analista quantitativo especializado em opções binárias OTC (Over-The-Counter). "
+    "CONTEXTO OTC OBRIGATÓRIO: mercados OTC são sintéticos, operam 24h, têm liquidez artificial e "
+    "comportamento de tendência diferente do mercado real. "
+    "ADX entre 15 e 25 é COMPLETAMENTE NORMAL em OTC — NÃO vete sinais apenas por ADX baixo. "
+    "Só considere ADX problemático se estiver abaixo de 10 junto com RSI entre 45-55 (zona neutra total). "
+    "Payout acima de 85% já compensa winrate de 55% — priorize entrar quando o setup técnico está alinhado. "
+    "CRITÉRIOS DE QUALIDADE: Score>=8 + confiança>=85% + payout>=80% = sinal forte, prefira OPERAR. "
+    "RSI fora da zona neutra (abaixo de 45 ou acima de 55) com MACD confirmando é entrada válida em OTC. "
+    "\n\nNOVOS CAMPOS DE CONTEXTO (use ativamente):\n"
+    "• last_5_candles: últimas 5 velas OHLCV fechadas. Verifique padrões: sequência de altas/baixas, "
+    "corpos crescentes (momentum), pavios longos (rejeição). Se as 3 últimas velas vão contra a direção do sinal, "
+    "seja conservador. Se concordam, reforça a entrada.\n"
+    "• pair_performance: winrate ESPECÍFICO desta combinação ativo+estratégia. "
+    "Se sample>=10 e winrate<45% — fortemente conservador (par tóxico). "
+    "Se sample>=10 e winrate>=60% — confie no par, prefira OPERAR.\n"
+    "• volume_ratio: volume da última vela vs média 20 anteriores. >1.5 = volume forte (reforça sinal). "
+    "<0.5 = volume fraco (cuidado, baixa convicção). 0 = sem dados, ignore.\n"
+    "• weekday: dia da semana. Sex/Dom em OTC são noisier. Considere conservadorismo extra.\n"
+    "• hour_brt: horário. Madrugada (00-04 BRT) tem menos liquidez — setups precisam estar muito limpos.\n\n"
+    "recent_results mostra os últimos resultados neste ativo: 1-2 losses pontuais NÃO invalidam sinal forte. "
+    "last_ai_feedback (se presente) mostra o resultado da última decisão da IA neste ativo: "
+    "use como aprendizado — se a última decisão de OPERAR resultou em LOSS, seja ligeiramente mais conservador; "
+    "se resultou em WIN, confirme se o contexto atual é similar antes de aprovar novamente. "
+    "last_ai_history (se presente) lista as últimas 3 decisões neste ativo (mais antiga → mais recente). "
+    "Use para detectar padrões: 3 LOSSes consecutivos com a mesma estratégia = estratégia falhando neste ativo. "
+    "2+ WINs recentes na mesma direção = momento favorável. "
+    "RECOMENDE IGNORAR apenas se houver razão técnica CLARA e ESPECÍFICA: RSI na zona neutra (45-55) + "
+    "MACD sem direção + volatilidade extrema (bb_width>0.05) ou streak de 3+ losses consecutivos no ativo, "
+    "OU pair_performance com sample>=10 e winrate<40%. "
     "Responda APENAS em JSON válido com as chaves: decision ('OPERAR'|'IGNORAR'), "
-    "confidence (0-100, int), rationale (string curta, <=280 chars)."
+    "confidence (0-100, int), rationale (string curta, <=300 chars)."
 )
 
 
@@ -94,8 +121,12 @@ def _cache_key(payload: Dict[str, Any]) -> str:
       - score      → step 0.5
       - confidence → step 5
       - payout     → step 5
+      - hour       → bucket de 4h (madrugada/manhã/tarde/noite)
+      - pair_wr    → step 10 (faixas de winrate do par)
+      - vol_ratio  → step 0.25 (faixas de volume relativo)
     Inclui padrão de resultados recentes para invalidar cache após losses.
     """
+    _pair = payload.get("pair_performance") or {}
     key_obj = {
         "a": payload.get("asset"),
         "t": payload.get("timeframe"),
@@ -104,9 +135,13 @@ def _cache_key(payload: Dict[str, Any]) -> str:
         "sc": _bucket(float(payload.get("score", 0)), 0.5),
         "cf": _bucket(float(payload.get("confidence", 0)), 5),
         "po": _bucket(float(payload.get("payout", 0)), 5),
+        "hr": int(payload.get("hour_brt", 0)) // 4,
+        "pwr": _bucket(float(_pair.get("winrate", 0)), 10) if _pair.get("sample", 0) >= 6 else -1,
+        "vr": _bucket(float(payload.get("volume_ratio", 0)), 0.25),
         "lat": bool((payload.get("market") or "").lower().find("lateral") >= 0
                     or (payload.get("market") or "").lower().find("sim") >= 0),
-        "rr": _results_pattern(payload.get("recent_results", [])),  # padrão de resultados recentes
+        "rr": _results_pattern(payload.get("recent_results", [])),
+        "fb": (payload.get("last_ai_feedback") or {}).get("result", ""),
     }
     raw = json.dumps(key_obj, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -186,10 +221,10 @@ def _sanitize_for_json(obj):
 class DeepSeekAI:
     """Cliente assíncrono para DeepSeek com cache de decisões."""
 
-    def __init__(self, timeout: float = 5.0, use_cache: bool = True):
+    def __init__(self, api_key: str = "", timeout: float = 12.0, use_cache: bool = True):
         self.timeout = timeout
         self.use_cache = use_cache
-        self.api_key = get_api_key()
+        self.api_key = get_api_key(api_key)
 
     def cache_stats(self) -> Dict[str, int]:
         return _cache.stats()
@@ -199,6 +234,17 @@ class DeepSeekAI:
         return await _cache.clear()
 
     async def validate_signal(self, payload: Dict[str, Any]) -> AIDecision:
+        # Auto-aprovação: sinais excepcionais não precisam de voto da IA
+        _score = float(payload.get("score", 0))
+        _conf = float(payload.get("confidence", 0))
+        if _score >= 8.5 and _conf >= 90.0:
+            logger.info(f"IA auto-aprovado: score={_score:.2f} conf={_conf:.0f}% — bypass da API.")
+            return AIDecision(
+                operate=True,
+                confidence=_conf,
+                rationale=f"Auto-aprovado: score {_score:.1f} + confiança {_conf:.0f}% acima dos limiares excepcionais.",
+            )
+
         if self.use_cache:
             key = _cache_key(payload)
             cached = await _cache.get(key)
@@ -228,7 +274,7 @@ class DeepSeekAI:
             ],
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
-            "max_tokens": 300,
+            "max_tokens": 400,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
@@ -267,5 +313,22 @@ class DeepSeekAI:
                     confidence=fallback_conf,
                     rationale=f"IA indisponível ({type(e).__name__}) — fallback por score da estratégia",
                 )
-            logger.warning(f"Erro IA (resposta inválida): {e}. Decisão default: IGNORAR.")
+            # Erro de resposta inválida (JSON inesperado, quota, etc.)
+            # Fallback baseado em score: apenas aprova sinais acima do limiar mínimo robusto.
+            _score = float(safe_payload.get("score", 0))
+            _fallback_threshold = 7.0
+            if _score >= _fallback_threshold:
+                logger.warning(
+                    f"Erro IA (resposta inválida): {type(e).__name__}. "
+                    f"Score={_score:.2f} >= {_fallback_threshold} — fallback OPERAR."
+                )
+                return AIDecision(
+                    operate=True,
+                    confidence=fallback_conf,
+                    rationale=f"IA indisponível (erro interno) — fallback por score {_score:.1f}",
+                )
+            logger.warning(
+                f"Erro IA (resposta inválida): {type(e).__name__}: {e}. "
+                f"Score={_score:.2f} < {_fallback_threshold} — IGNORAR."
+            )
             return AIDecision(operate=False, confidence=0.0, rationale=f"Erro IA: {e}")

@@ -12,6 +12,18 @@ pocket_brainy/data/strategies.json
 pocket_brainy/data/logs/
 .env
 
+# Perfil do Chrome do Playwright (binários enormes + cookies/login sensíveis)
+pocket_brainy/data/chrome_profile/
+
+# Dados de runtime / estatísticas (gerados pelo bot)
+pocket_brainy/data/ai_feedback.json
+pocket_brainy/data/candle_patterns.json
+pocket_brainy/data/core_stats.json
+pocket_brainy/data/pair_stats.json
+pocket_brainy/data/regime_stats.json
+pocket_brainy/data/scalper_stats.json
+pocket_brainy/data/time_stats.json
+
 # Python
 __pycache__/
 *.py[cod]

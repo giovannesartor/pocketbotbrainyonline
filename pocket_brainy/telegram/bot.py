@@ -7,9 +7,11 @@ responde a callbacks e envia notificações ao vivo.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
 
 from telegram import Update
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -23,6 +25,8 @@ from ..utils.logger import get_logger
 from .handlers import Handlers
 
 logger = get_logger("telegram.bot")
+
+BRT = timezone(timedelta(hours=-3))
 
 
 class TelegramInterface:
@@ -43,8 +47,26 @@ class TelegramInterface:
         self.app = ApplicationBuilder().token(token).build()
         self.app.add_handler(CommandHandler(["start", "menu"], self.handlers.cmd_start))
         self.app.add_handler(CommandHandler("stats", self.handlers.cmd_stats))
+        self.app.add_handler(CommandHandler("ssid", self.handlers.cmd_ssid))
+        self.app.add_handler(CommandHandler("saldo", self.handlers.cmd_saldo))
+        self.app.add_handler(CommandHandler("topares", self.handlers.cmd_topares))
+        self.app.add_handler(CommandHandler("scalpstats", self.handlers.cmd_scalpstats))
+        self.app.add_handler(CommandHandler("debug", self.handlers.cmd_debug))
+        self.app.add_handler(CommandHandler("alerts", self.handlers.cmd_alerts))
+        self.app.add_handler(CommandHandler("why", self.handlers.cmd_why))
+        self.app.add_handler(CommandHandler("topcores", self.handlers.cmd_topcores))
+        self.app.add_handler(CommandHandler("topativos", self.handlers.cmd_topativos))
+        self.app.add_handler(CommandHandler("heatmap", self.handlers.cmd_heatmap))
+        self.app.add_handler(CommandHandler("timestats", self.handlers.cmd_timestats))
+        self.app.add_handler(CommandHandler("cores", self.handlers.cmd_cores))
+        self.app.add_handler(CommandHandler("backtest", self.handlers.cmd_backtest))
+        self.app.add_handler(CommandHandler("now", self.handlers.cmd_now))
+        self.app.add_handler(CommandHandler("heatmap_visual", self.handlers.cmd_heatmap_visual))
+        self.app.add_handler(CommandHandler("regime", self.handlers.cmd_regime))
+        self.app.add_handler(CommandHandler("help", self.handlers.cmd_help))
         self.app.add_handler(CallbackQueryHandler(self.handlers.on_callback))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handlers.on_text))
+        self.app.add_error_handler(self._on_error)
 
         await self.app.initialize()
         await self.app.start()
@@ -64,27 +86,128 @@ class TelegramInterface:
             pass
         self._running = False
 
+    async def _on_error(self, update, context) -> None:
+        """Handler global de erros do PTB. Silencia ruído conhecido."""
+        err = context.error
+        # Conflict = outra instância do bot está com polling ativo (Railway, outro terminal).
+        if isinstance(err, Conflict):
+            if not getattr(self, "_warned_conflict", False):
+                logger.warning(
+                    "⚠️ Telegram CONFLICT: outra instância deste bot está rodando "
+                    "(provavelmente no Railway ou em outro terminal). "
+                    "Pare a outra instância OU mude o token. Silenciando próximos avisos."
+                )
+                self._warned_conflict = True
+            return
+        # Erros de rede transitórios — log curto, sem stack trace.
+        if isinstance(err, (NetworkError, TimedOut)):
+            logger.warning(f"Telegram rede: {err}")
+            return
+        logger.exception(f"Telegram erro não tratado: {err}")
+
     async def _greet(self) -> None:
         cfg = self.bot.cfg_manager.config
-        modo = "🧪 SIMULAÇÃO" if cfg.simulation_mode else "💰 CONTA REAL"
+        conta = "🟢 Demo" if cfg.po_demo else "🔴 Real"
+        ia_str = "✅ Ativa" if cfg.ai_enabled else "❌ Inativa"
+        tfs = ", ".join(cfg.timeframes)
+        sw = f"{cfg.stop_win}%" if cfg.stop_win_is_percent else f"$ {cfg.stop_win:.2f}"
+        sl = f"{cfg.stop_loss}%" if cfg.stop_loss_is_percent else f"$ {cfg.stop_loss:.2f}"
+        hora_brt = datetime.now(BRT).strftime("%H:%M:%S BRT")
         await self.send(
-            "🧠 <b>Pocket Brainy conectado ao Telegram!</b>\n\n"
-            f"{modo}\n"
+            f"🧠 <b>Pocket Brainy conectado!</b>\n\n"
+            f"📅 Hora: <code>{hora_brt}</code>\n"
+            f"💰 Conta: {conta}\n"
+            f"🧠 IA DeepSeek: {ia_str}\n"
+            f"⏱️ Timeframes: <b>{tfs}</b>\n"
+            f"🎯 Stop Win: <b>{sw}</b> | Stop Loss: <b>{sl}</b>\n\n"
             "Envie <b>/menu</b> para abrir o painel de controle.\n"
-            "<i>Dica: comece em modo simulação até ganhar confiança nas estratégias.</i>"
+            "<i>Dica: configure credenciais antes de iniciar.</i>"
         )
 
     # -------- envio --------
-    async def send(self, text: str, **kwargs) -> None:
+    def _observer_chat_ids(self) -> list[int]:
+        """Lista de chat_ids observadores (somente leitura) — recebem notificações
+        mas não podem controlar o bot. Ignora valores inválidos e o próprio chat principal."""
+        cfg = self.bot.cfg_manager.config
+        main_id = str(cfg.telegram_chat_id or "")
+        out: list[int] = []
+        for raw in getattr(cfg, "telegram_observer_chat_ids", []) or []:
+            s = str(raw).strip()
+            if not s or s == main_id:
+                continue
+            try:
+                out.append(int(s))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    async def _broadcast_observers(self, text: str, **kwargs) -> None:
+        """Envia o mesmo texto para todos os observadores. Falhas são silenciadas."""
         if not self.app:
             return
+        for cid in self._observer_chat_ids():
+            try:
+                await self.app.bot.send_message(
+                    chat_id=cid, text=text, parse_mode="HTML", **kwargs
+                )
+            except Exception as e:
+                logger.warning(f"Falha ao enviar para observador {cid}: {e}")
+
+    async def send(self, text: str, **kwargs) -> Optional[int]:
+        """Envia mensagem e retorna message_id (ou None em caso de falha)."""
+        if not self.app:
+            return None
         chat_id = self.bot.cfg_manager.config.telegram_chat_id
         if not chat_id:
-            return
+            return None
         try:
-            await self.app.bot.send_message(chat_id=int(chat_id), text=text, parse_mode="HTML", **kwargs)
+            msg = await self.app.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode="HTML", **kwargs
+            )
+            # Espelha para observadores (não bloqueia retorno do message_id principal)
+            await self._broadcast_observers(text, **kwargs)
+            return msg.message_id
         except Exception as e:
             logger.warning(f"Falha ao enviar mensagem Telegram: {e}")
+            return None
+
+    async def edit_message(self, message_id: int, text: str, **kwargs) -> bool:
+        """Edita mensagem existente. Retorna True se bem-sucedido."""
+        if not self.app:
+            return False
+        chat_id = self.bot.cfg_manager.config.telegram_chat_id
+        if not chat_id:
+            return False
+        try:
+            await self.app.bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+                **kwargs,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Falha ao editar mensagem {message_id}: {e}")
+            return False
+
+    async def pin_message(self, message_id: int) -> bool:
+        """Fixa uma mensagem no topo do chat. Retorna True se bem-sucedido."""
+        if not self.app:
+            return False
+        chat_id = self.bot.cfg_manager.config.telegram_chat_id
+        if not chat_id:
+            return False
+        try:
+            await self.app.bot.pin_chat_message(
+                chat_id=int(chat_id),
+                message_id=message_id,
+                disable_notification=True,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Falha ao fixar mensagem {message_id}: {e}")
+            return False
 
     # -------- rendering --------
     def render_config(self) -> str:
@@ -99,13 +222,14 @@ class TelegramInterface:
             f"🛑 Stop Loss: {sl}\n"
             f"📈 Payout mín.: {c.min_payout:.0f}%\n"
             f"✅ Assertividade mín.: {c.min_assertiveness:.0f}%\n"
+            f"🎯 Score mínimo: {c.min_score:.1f}\n"
+            f"🔁 Reentrada inteligente: {'✅ ON' if c.smart_reentry else '❌ OFF'}\n"
             f"⏱️ Timeframes: {', '.join(c.timeframes)}\n"
             f"🕹️ Ativos: {c.asset_mode} ({', '.join(c.manual_assets) if c.asset_mode == 'manual' else 'top payouts'})\n"
             f"🎲 Martingale: {'ON' if mg.enabled else 'OFF'} (máx {mg.max_level}, x{mg.multiplier}, "
             f"{'reset' if mg.reset_after_win else 'sem reset'})\n"
             f"🔢 Trades abertos máx.: {c.max_open_trades}\n"
             f"🧠 IA: {'ON' if c.ai_enabled else 'OFF'}\n"
-            f"🧪 Simulação: {'ON' if c.simulation_mode else 'OFF'}\n"
             f"🚦 Máx. trades/dia: {c.max_trades_per_day} | Streak loss máx: {c.max_loss_streak}\n"
             f"⏳ Delay entre ops: {c.delay_between_trades}s"
         )
@@ -113,18 +237,29 @@ class TelegramInterface:
     def render_status(self) -> str:
         s = self.bot.state
         c = self.bot.cfg_manager.config
+        # Idade do último refresh do saldo (ajuda a perceber se está "travado")
+        import time as _t
+        age = _t.time() - getattr(self.bot, "_last_balance_refresh", 0.0)
+        age_txt = f" <i>({int(age)}s)</i>" if age < 600 and age > 0 else ""
         return (
             "📊 <b>Status</b>\n"
             f"Bot: {'🟢 RODANDO' if s.running else '🔴 PARADO'}\n"
             f"Conectado: {'✅' if s.connected else '❌'}\n"
             f"Saldo inicial: $ {s.start_balance:.2f}\n"
-            f"Saldo atual: $ {s.current_balance:.2f}\n"
+            f"Saldo atual: $ {s.current_balance:.2f}{age_txt}\n"
             f"PnL do dia: $ {s.daily_pnl:+.2f}\n"
             f"Trades hoje: {s.trades_today} (W:{s.wins} / L:{s.losses} / D:{s.draws})\n"
             f"Winrate: {s.winrate:.1f}%\n"
-            f"Streak loss: {s.current_loss_streak} | Martingale nv: {s.martingale_level}\n"
-            f"Modo: {'🧪 SIM' if c.simulation_mode else '💰 REAL'}"
+            f"Streak loss: {s.current_loss_streak} | Martingale nv: {s.martingale_level}"
         )
+
+    async def render_status_live(self) -> str:
+        """Versão async: força refresh do saldo na corretora antes de renderizar."""
+        try:
+            await self.bot.refresh_balance()
+        except Exception:
+            pass
+        return self.render_status()
 
     def render_stats(self) -> str:
         from . import messages as msgs

@@ -11,5 +11,4 @@ playwright>=1.42
 tenacity>=8.2
 
 # PocketOption (biblioteca não-oficial da comunidade ChipaDevTeam).
-# Instale separadamente (não funciona via requirements.txt como URL git em todos os pip):
-#   pip install git+https://github.com/ChipaDevTeam/PocketOptionAPI.git
+git+https://github.com/ChipaDevTeam/PocketOptionAPI.git

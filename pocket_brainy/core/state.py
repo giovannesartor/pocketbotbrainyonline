@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 HISTORY_PATH = DATA_DIR / "history.json"
+_BRT = timezone(timedelta(hours=-3))
 
 
 @dataclass
@@ -25,6 +26,10 @@ class TradeResult:
     profit: float = 0.0
     timeframe: str = "M1"
     martingale_level: int = 0
+    # contexto de mercado no momento da entrada (para análise posterior)
+    market_adx: float = 0.0
+    market_rsi: float = 0.0
+    market_bb_width: float = 0.0
 
 
 @dataclass
@@ -55,6 +60,8 @@ class BotState:
             self.current_loss_streak += 1
         elif trade.result == "DRAW":
             self.draws += 1
+        else:
+            return  # CANCELADO / SIM — não afeta estatísticas diárias
         self.daily_pnl += trade.profit
         self.trades_today += 1
 
@@ -85,5 +92,33 @@ class BotState:
             with HISTORY_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             self.history = [TradeResult(**t) for t in data]
+            self._rebuild_daily_stats()  # reconstrói contadores do dia após reiniciar
         except Exception:
             self.history = []
+
+    def _rebuild_daily_stats(self) -> None:
+        """Reconstrói wins/losses/pnl/streak do dia atual a partir do histórico.
+        Chamado em load_history() para que um reinicio do bot não zere o placar.
+        """
+        today = datetime.now(_BRT).strftime("%Y-%m-%d")
+        self.wins = 0
+        self.losses = 0
+        self.draws = 0
+        self.daily_pnl = 0.0
+        self.trades_today = 0
+        self.current_loss_streak = 0
+        for trade in self.history:
+            if not trade.timestamp.startswith(today):
+                continue
+            if trade.result == "WIN":
+                self.wins += 1
+                self.current_loss_streak = 0
+            elif trade.result == "LOSS":
+                self.losses += 1
+                self.current_loss_streak += 1
+            elif trade.result == "DRAW":
+                self.draws += 1
+            else:
+                continue  # CANCELADO / SIM
+            self.daily_pnl += trade.profit
+            self.trades_today += 1
