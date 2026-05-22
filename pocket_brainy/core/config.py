@@ -12,9 +12,24 @@ from ..utils.logger import get_logger
 
 logger = get_logger("core.config")
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# Permite redirecionar o diretório de dados (útil em Railway/containers com
+# volume montado, p.ex. POCKET_DATA_DIR=/data).
+_default_data_dir = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(os.environ.get("POCKET_DATA_DIR", str(_default_data_dir)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = DATA_DIR / "config.json"
+
+# Bootstrap: se o config.json não existir no DATA_DIR mas a variável
+# POCKET_CONFIG_JSON estiver definida (JSON completo), grava no disco.
+_bootstrap_json = os.environ.get("POCKET_CONFIG_JSON")
+if _bootstrap_json and not CONFIG_PATH.exists():
+    try:
+        # valida o JSON antes de escrever
+        json.loads(_bootstrap_json)
+        CONFIG_PATH.write_text(_bootstrap_json, encoding="utf-8")
+        logger.info(f"config.json criado a partir de POCKET_CONFIG_JSON em {CONFIG_PATH}")
+    except Exception as e:
+        logger.error(f"POCKET_CONFIG_JSON inválido: {e}")
 
 
 @dataclass
